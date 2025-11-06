@@ -4,6 +4,106 @@ from knowledge_neurons import (
     model_type,
 )
 import random
+import torch
+from transformers import BertConfig, BertForMaskedLM
+
+
+class DummyBatch(dict):
+    def to(self, device):
+        for key, value in self.items():
+            self[key] = value.to(device)
+        return self
+
+
+class DummyTokenizer:
+    def __init__(self):
+        self.vocab = {
+            "[PAD]": 0,
+            "[UNK]": 1,
+            "[MASK]": 2,
+            "prompt": 3,
+            "answer": 4,
+        }
+        self.mask_token_id = self.vocab["[MASK]"]
+        self.unk_token_id = self.vocab["[UNK]"]
+        self._inv_vocab = {v: k for k, v in self.vocab.items()}
+
+    def convert_tokens_to_ids(self, token: str) -> int:
+        return self.vocab.get(token, self.unk_token_id)
+
+    def decode(self, token_ids):
+        if isinstance(token_ids, int):
+            token_ids = [token_ids]
+        return " ".join(self._inv_vocab.get(t, "[UNK]") for t in token_ids)
+
+    def __call__(self, text: str, return_tensors: str = "pt"):
+        tokens = [
+            self.vocab.get(token, self.unk_token_id)
+            for token in text.split()
+        ]
+        if not tokens:
+            tokens = [self.mask_token_id]
+        input_ids = torch.tensor([tokens], dtype=torch.long)
+        attention_mask = torch.ones_like(input_ids)
+        token_type_ids = torch.zeros_like(input_ids)
+        return DummyBatch(
+            {
+                "input_ids": input_ids,
+                "attention_mask": attention_mask,
+                "token_type_ids": token_type_ids,
+            }
+        )
+
+
+def test_module_level_scores_restore_weights():
+    config = BertConfig(
+        vocab_size=5,
+        hidden_size=8,
+        num_hidden_layers=2,
+        num_attention_heads=2,
+        intermediate_size=16,
+    )
+    model = BertForMaskedLM(config)
+    tokenizer = DummyTokenizer()
+    kn = KnowledgeNeurons(model, tokenizer, model_type="bert")
+
+    prompt = "prompt [MASK]"
+    ground_truth = "answer"
+
+    original_params = {}
+    for layer_idx in range(kn.n_layers()):
+        layer_snapshot = {}
+        for module_key in kn.module_param_attrs:
+            module, parameter = kn._get_module_parameter(layer_idx, module_key)
+            layer_snapshot[module_key] = parameter.detach().clone()
+            bias = getattr(module, "bias", None)
+            if bias is not None:
+                layer_snapshot[f"{module_key}__bias"] = bias.detach().clone()
+        original_params[layer_idx] = layer_snapshot
+
+    scores = kn.get_scores(
+        prompt,
+        ground_truth,
+        steps=4,
+        batch_size=2,
+        attribution_method="integrated_grads",
+        pbar=False,
+        target_scope="modules",
+    )
+
+    assert set(scores.keys()) == set(kn.module_param_attrs.keys())
+    for value in scores.values():
+        assert value.shape[0] == kn.n_layers()
+
+    for layer_idx in range(kn.n_layers()):
+        for module_key in kn.module_param_attrs:
+            module, parameter = kn._get_module_parameter(layer_idx, module_key)
+            assert torch.equal(parameter, original_params[layer_idx][module_key])
+            bias = getattr(module, "bias", None)
+            if bias is not None:
+                assert torch.equal(
+                    bias, original_params[layer_idx][f"{module_key}__bias"]
+                )
 
 
 def test_gpt(MODEL_NAME: str):

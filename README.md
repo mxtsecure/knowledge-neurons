@@ -80,6 +80,19 @@ refined_neurons = kn.get_refined_neurons(
     coarse_adaptive_threshold=ADAPTIVE_THRESHOLD,
 )
 
+# alternatively, request module-level attribution scores. Each module key corresponds
+# to the dotted path documented inline within `KnowledgeNeurons.__init__`.
+module_scores = kn.get_scores(
+    TEXT,
+    GROUND_TRUTH,
+    batch_size=BATCH_SIZE,
+    steps=STEPS,
+    attribution_method="integrated_grads",
+    target_scope="modules",
+)
+for module_name, layer_scores in module_scores.items():
+    print(module_name, layer_scores.shape)
+
 # suppress the activations at the refined neurons + test the effect on a relevant prompt
 # 'results_dict' is a dictionary containing the probability of the ground truth being generated before + after modification, as well as other info
 # 'unpatch_fn' is a function you can use to undo the activation suppression in the model. 
