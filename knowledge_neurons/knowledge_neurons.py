@@ -6,7 +6,7 @@ import einops
 from tqdm import tqdm
 import numpy as np
 import collections
-from typing import List, Optional, Tuple, Callable
+from typing import Dict, List, Optional, Tuple, Callable, Union
 import torch
 import torch.nn.functional as F
 import einops
@@ -41,11 +41,25 @@ class KnowledgeNeurons:
             self.output_ff_attr = "output.dense.weight"
             self.word_embeddings_attr = "bert.embeddings.word_embeddings.weight"
             self.unk_token = getattr(self.tokenizer, "unk_token_id", None)
+            self.module_param_attrs = {
+                "q_proj": "attention.self.query",  # Query projection linear layer within multi-head self-attention
+                "k_proj": "attention.self.key",  # Key projection linear layer within multi-head self-attention
+                "v_proj": "attention.self.value",  # Value projection linear layer within multi-head self-attention
+                "o_proj": "attention.output.dense",  # Output projection that mixes attention heads
+                "mlp_up": "intermediate.dense",  # Feed-forward block that expands hidden activations
+                "mlp_down": "output.dense",  # Feed-forward block that projects back to the hidden size
+            }
         elif "gpt" in model_type:
             self.transformer_layers_attr = "transformer.h"
             self.input_ff_attr = "mlp.c_fc"
             self.output_ff_attr = "mlp.c_proj.weight"
             self.word_embeddings_attr = "transformer.wpe"
+            self.module_param_attrs = {
+                "qkv_proj": "attn.c_attn",  # Combined query/key/value projection conv1d block
+                "o_proj": "attn.c_proj",  # Attention output projection block
+                "mlp_up": "mlp.c_fc",  # Feed-forward expansion block
+                "mlp_down": "mlp.c_proj",  # Feed-forward contraction block
+            }
         else:
             raise NotImplementedError
 
@@ -70,6 +84,35 @@ class KnowledgeNeurons:
 
     def _get_transformer_layers(self):
         return get_attributes(self.model, self.transformer_layers_attr)
+
+    def _get_module_parameter(
+        self, layer_idx: int, module_key: str
+    ) -> Tuple[nn.Module, nn.Parameter]:
+        """Return the module and weight parameter identified by ``module_key`` in ``layer_idx``."""
+
+        if module_key not in self.module_param_attrs:
+            raise KeyError(f"Unknown module key: {module_key}")
+        transformer_layers = self._get_transformer_layers()
+        if layer_idx >= len(transformer_layers):
+            raise IndexError(
+                f"Layer index {layer_idx} out of range for {len(transformer_layers)} layers"
+            )
+        module_attr = self.module_param_attrs[module_key]
+        module = get_attributes(transformer_layers[layer_idx], module_attr)
+        if not isinstance(module, nn.Module):
+            raise TypeError(
+                f"Attribute '{module_attr}' resolved to a non-module object: {type(module)}"
+            )
+        if not hasattr(module, "weight"):
+            raise AttributeError(
+                f"Module '{module_attr}' does not expose a 'weight' parameter"
+            )
+        parameter = module.weight
+        if not isinstance(parameter, nn.Parameter):
+            raise TypeError(
+                f"Attribute 'weight' of module '{module_attr}' is not an nn.Parameter"
+            )
+        return module, parameter
 
     def _prepare_inputs(self, prompt, target=None, encoded_input=None):
         if encoded_input is None:
@@ -200,6 +243,52 @@ class KnowledgeNeurons:
         self.baseline_activations = None
         return baseline_outputs, baseline_activations
 
+    def _integrated_grads_for_module(
+        self,
+        encoded_input: Dict[str, torch.Tensor],
+        layer_idx: int,
+        module_key: str,
+        mask_idx: int,
+        target_idx: int,
+        steps: int,
+    ) -> torch.Tensor:
+        """Estimate the integrated gradient for ``module_key`` in ``layer_idx``."""
+
+        module, parameter = self._get_module_parameter(layer_idx, module_key)
+        original_weight = parameter.detach().clone()
+        baseline_weight = torch.zeros_like(original_weight)
+        delta_weight = original_weight - baseline_weight
+
+        bias = getattr(module, "bias", None)
+        original_bias = bias.detach().clone() if bias is not None else None
+
+        ig_value = torch.zeros((), device=parameter.device, dtype=parameter.dtype)
+        alphas = torch.linspace(0.0, 1.0, steps, device=parameter.device)
+
+        for alpha in alphas:
+            scaled_weight = baseline_weight + alpha * delta_weight
+            parameter.data.copy_(scaled_weight)
+            parameter.requires_grad_(True)
+            if bias is not None and original_bias is not None:
+                bias.data.copy_(original_bias)
+                bias.requires_grad_(True)
+
+            self.model.zero_grad(set_to_none=True)
+            outputs = self.model(**encoded_input)
+            probs = F.softmax(outputs.logits[:, mask_idx, :], dim=-1)
+            target_prob = probs[:, target_idx].sum()
+            grad = torch.autograd.grad(target_prob, parameter, retain_graph=False)[0]
+            ig_value += (grad * delta_weight).sum() / steps
+
+            parameter.data.copy_(original_weight)
+            if bias is not None and original_bias is not None:
+                bias.data.copy_(original_bias)
+
+        parameter.data.copy_(original_weight)
+        if bias is not None and original_bias is not None:
+            bias.data.copy_(original_bias)
+        return ig_value.detach()
+
     def get_scores(
         self,
         prompt: str,
@@ -208,6 +297,7 @@ class KnowledgeNeurons:
         steps: int = 20,
         attribution_method: str = "integrated_grads",
         pbar: bool = True,
+        target_scope: str = "neurons",
     ):
         """
         Gets the attribution scores for a given prompt and ground truth.
@@ -221,9 +311,20 @@ class KnowledgeNeurons:
             total number of steps (per token) for the integrated gradient calculations
         `attribution_method`: str
             the method to use for getting the scores. Choose from 'integrated_grads' or 'max_activations'.
+        `target_scope`: str
+            whether to attribute activations ("neurons") or full module parameters ("modules").
         """
 
+        if target_scope not in {"neurons", "modules"}:
+            raise ValueError(f"Unknown target scope: {target_scope}")
+        if target_scope == "modules" and not self.module_param_attrs:
+            raise ValueError("Module parameter mappings are not defined for this model")
         scores = []
+        module_scores: Dict[str, List[torch.Tensor]] = (
+            {k: [] for k in self.module_param_attrs}
+            if target_scope == "modules"
+            else {}
+        )
         encoded_input = self.tokenizer(prompt, return_tensors="pt").to(self.device)
         for layer_idx in tqdm(
             range(self.n_layers()),
@@ -238,8 +339,18 @@ class KnowledgeNeurons:
                 batch_size=batch_size,
                 steps=steps,
                 attribution_method=attribution_method,
+                target_scope=target_scope,
             )
-            scores.append(layer_scores)
+            if target_scope == "modules":
+                for module_key in self.module_param_attrs:
+                    module_scores[module_key].append(layer_scores[module_key])
+            else:
+                scores.append(layer_scores)
+        if target_scope == "modules":
+            return {
+                module_key: torch.stack(module_scores[module_key])
+                for module_key in self.module_param_attrs
+            }
         return torch.stack(scores)
 
     def get_coarse_neurons(
@@ -253,7 +364,8 @@ class KnowledgeNeurons:
         percentile: float = None,
         attribution_method: str = "integrated_grads",
         pbar: bool = True,
-    ) -> List[List[int]]:
+        target_scope: str = "neurons",
+    ) -> List[List[Union[int, str]]]:
         """
         Finds the 'coarse' neurons for a given prompt and ground truth.
         The coarse neurons are the neurons that are most activated by a single prompt.
@@ -275,6 +387,8 @@ class KnowledgeNeurons:
             If not None, then we only keep neurons with integrated grads in this percentile of all integrated grads.
         `attribution_method`: str
             the method to use for getting the scores. Choose from 'integrated_grads' or 'max_activations'.
+        `target_scope`: str
+            whether to return individual neuron indices ("neurons") or module identifiers ("modules").
         """
         attribution_scores = self.get_scores(
             prompt,
@@ -283,21 +397,44 @@ class KnowledgeNeurons:
             steps=steps,
             pbar=pbar,
             attribution_method=attribution_method,
+            target_scope=target_scope,
         )
         assert (
             sum(e is not None for e in [threshold, adaptive_threshold, percentile]) == 1
         ), f"Provide one and only one of threshold / adaptive_threshold / percentile"
         if adaptive_threshold is not None:
-            threshold = attribution_scores.max().item() * adaptive_threshold
+            if target_scope == "modules":
+                stacked_scores = torch.stack(
+                    [attribution_scores[k] for k in self.module_param_attrs], dim=-1
+                )
+                threshold = (
+                    stacked_scores.max().item() * adaptive_threshold
+                    if stacked_scores.numel() > 0
+                    else 0.0
+                )
+            else:
+                threshold = attribution_scores.max().item() * adaptive_threshold
+        if target_scope == "modules":
+            # Interpret the attribution tensor as layer-wise module scores rather than neuron activations.
+            stacked_scores = torch.stack(
+                [attribution_scores[k] for k in self.module_param_attrs], dim=-1
+            )
+            if threshold is not None:
+                mask = stacked_scores > threshold
+            else:
+                s = stacked_scores.flatten().detach().cpu().numpy()
+                mask = stacked_scores > np.percentile(s, percentile)
+            indices = torch.nonzero(mask).cpu().tolist()
+            module_names = list(self.module_param_attrs.keys())
+            return [[layer_idx, module_names[module_idx]] for layer_idx, module_idx in indices]
         if threshold is not None:
             return torch.nonzero(attribution_scores > threshold).cpu().tolist()
-        else:
-            s = attribution_scores.flatten().detach().cpu().numpy()
-            return (
-                torch.nonzero(attribution_scores > np.percentile(s, percentile))
-                .cpu()
-                .tolist()
-            )
+        s = attribution_scores.flatten().detach().cpu().numpy()
+        return (
+            torch.nonzero(attribution_scores > np.percentile(s, percentile))
+            .cpu()
+            .tolist()
+        )
 
     def get_refined_neurons(
         self,
@@ -311,7 +448,8 @@ class KnowledgeNeurons:
         coarse_threshold: Optional[float] = None,
         coarse_percentile: Optional[float] = None,
         quiet=False,
-    ) -> List[List[int]]:
+        target_scope: str = "neurons",
+    ) -> List[List[Union[int, str]]]:
         """
         Finds the 'refined' neurons for a given set of prompts and a ground truth / expected output.
 
@@ -337,6 +475,8 @@ class KnowledgeNeurons:
             threshold for the coarse neurons
         `coarse_percentile`: float
             percentile for the coarse neurons
+        `target_scope`: str
+            whether to combine neuron-level or module-level identifiers.
         """
         assert isinstance(
             prompts, list
@@ -358,6 +498,7 @@ class KnowledgeNeurons:
                     threshold=coarse_threshold,
                     percentile=coarse_percentile,
                     pbar=False,
+                    target_scope=target_scope,
                 )
             )
         if negative_examples is not None:
@@ -377,6 +518,7 @@ class KnowledgeNeurons:
                         threshold=coarse_threshold,
                         percentile=coarse_percentile,
                         pbar=False,
+                        target_scope=target_scope,
                     )
                 )
         if not quiet:
@@ -401,7 +543,7 @@ class KnowledgeNeurons:
 
         total_refined_neurons = len(refined_neurons)
         if not quiet:
-            print(f"{total_refined_neurons} neurons remaining after refining")
+            print(f"{total_refined_neurons} attribution entries remaining after refining")
         return refined_neurons
 
     def get_scores_for_layer(
@@ -413,6 +555,7 @@ class KnowledgeNeurons:
         steps: int = 20,
         encoded_input: Optional[int] = None,
         attribution_method: str = "integrated_grads",
+        target_scope: str = "neurons",
     ):
         """
         get the attribution scores for a given layer
@@ -430,9 +573,16 @@ class KnowledgeNeurons:
             if not None, then use this encoded input instead of getting a new one
         `attribution_method`: str
             the method to use for getting the scores. Choose from 'integrated_grads' or 'max_activations'.
+        `target_scope`: str
+            whether to attribute activations ("neurons") or module parameters ("modules").
         """
-        assert steps % batch_size == 0
-        n_batches = steps // batch_size
+        if target_scope not in {"neurons", "modules"}:
+            raise ValueError(f"Unknown target scope: {target_scope}")
+        if target_scope == "neurons":
+            assert steps % batch_size == 0
+            n_batches = steps // batch_size
+        else:
+            n_batches = None
 
         # First we take the unmodified model and use a hook to return the baseline intermediate activations at our chosen target layer
         encoded_input, mask_idx, target_label = self._prepare_inputs(
@@ -446,6 +596,47 @@ class KnowledgeNeurons:
             n_sampling_steps = 1  # TODO: we might want to use multiple mask tokens even with bert models
 
         if attribution_method == "integrated_grads":
+            if target_scope == "modules":
+                module_scores = {
+                    module_key: torch.zeros((), device=self.device)
+                    for module_key in self.module_param_attrs
+                }
+
+                for i in range(n_sampling_steps):
+                    if i > 0 and self.model_type == "gpt":
+                        # retokenize new inputs
+                        encoded_input, mask_idx, target_label = self._prepare_inputs(
+                            prompt, ground_truth
+                        )
+                    baseline_outputs, _ = self.get_baseline_with_activations(
+                        encoded_input, layer_idx, mask_idx
+                    )
+                    if n_sampling_steps > 1:
+                        argmax_next_token = (
+                            baseline_outputs.logits[:, mask_idx, :]
+                            .argmax(dim=-1)
+                            .item()
+                        )
+                        next_token_str = self.tokenizer.decode(argmax_next_token)
+
+                    current_target = target_label[i] if n_sampling_steps > 1 else target_label
+                    for module_key in self.module_param_attrs:
+                        module_scores[module_key] += self._integrated_grads_for_module(
+                            encoded_input,
+                            layer_idx,
+                            module_key,
+                            mask_idx,
+                            current_target,
+                            steps,
+                        )
+                    if n_sampling_steps > 1:
+                        prompt += next_token_str
+
+                return {
+                    module_key: score / n_sampling_steps
+                    for module_key, score in module_scores.items()
+                }
+
             integrated_grads = []
 
             for i in range(n_sampling_steps):
@@ -542,6 +733,10 @@ class KnowledgeNeurons:
             )
             return integrated_grads
         elif attribution_method == "max_activations":
+            if target_scope != "neurons":
+                raise NotImplementedError(
+                    "Module scope is only supported for integrated gradients"
+                )
             activations = []
             for i in range(n_sampling_steps):
                 if i > 0 and self.model_type == "gpt":
