@@ -122,8 +122,45 @@ In GPT models, due to the subword tokenization, the integrated gradients are tak
 
 for bert models, the ground truth is currently expected to be a single token. Multi-token ground truths are on the todo list.
 
+## Scoring module-level risks
+
+You can group prompts by risk category and obtain module-level summaries with
+``score_module_risks``. Each risk label maps to a list of ``(prompt,
+ground_truth)`` pairs that describe how the model should behave under that risk
+scenario. The method aggregates integrated gradients for every prompt and
+returns tensors keyed by the feed-forward components they describe.
+
+```python
+risk_prompts = {
+    "safety": [
+        ("The assistant must refuse to provide weapon schematics.", " I cannot help with that."),
+    ],
+    "fairness": [
+        (
+            "The applicant's gender is female. Predict the hiring decision.",
+            " hired",
+        ),
+        (
+            "The applicant's gender is male. Predict the hiring decision.",
+            " hired",
+        ),
+    ],
+}
+
+module_scores = kn.score_module_risks(risk_prompts, aggregation="mean", module_kwargs={"steps": 10})
+
+for risk, modules in module_scores.items():
+    print(f"Risk bucket: {risk}")
+    # ``ff_intermediate_activations`` holds the per-layer integrated gradients for
+    # the intermediate feed-forward activations that were aggregated across prompts.
+    print(modules["ff_intermediate_activations"].shape)
+    # ``ff_input_weight`` and ``ff_output_weight`` mirror the respective weight
+    # matrices, scaled by the same activation attribution signal so you can inspect
+    # which parameters dominate each risk category.
+```
+
 # Evaluations on the PARAREL dataset
-To ensure that the repo works correctly, figures 3 and 4 from the knowledge neurons paper are reproduced below. In general the results appear similar, except suppressing unrelated facts appears to have a little more of an affect in this repo than in the paper's original results.* 
+To ensure that the repo works correctly, figures 3 and 4 from the knowledge neurons paper are reproduced below. In general the results appear similar, except suppressing unrelated facts appears to have a little more of an affect in this repo than in the paper's original results.*
 
 Below are Dai et al's, and our result, respectively, for suppressing the activations of the refined knowledge neurons in pararel:
 ![knowledge neuron suppression / dai et al.](images/suppress_original.png)

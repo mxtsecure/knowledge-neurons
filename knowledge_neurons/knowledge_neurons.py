@@ -6,7 +6,7 @@ import einops
 from tqdm import tqdm
 import numpy as np
 import collections
-from typing import List, Optional, Tuple, Callable
+from typing import Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 import torch
 import torch.nn.functional as F
 import einops
@@ -241,6 +241,147 @@ class KnowledgeNeurons:
             )
             scores.append(layer_scores)
         return torch.stack(scores)
+
+    @staticmethod
+    def _get_module_weight_tensor(module: nn.Module) -> torch.Tensor:
+        """Return a detached tensor view of the weights for a feed-forward sub-module."""
+        if isinstance(module, torch.Tensor):
+            return module.detach()
+        for attr in ("weight", "dense.weight"):
+            try:
+                weight = get_attributes(module, attr)
+                return weight.detach()
+            except AttributeError:
+                continue
+        raise AttributeError(
+            "Could not locate a weight tensor on the provided module; "
+            "expected an attribute named 'weight' or 'dense.weight'."
+        )
+
+    def module_integrated_gradients(
+        self,
+        prompt: str,
+        ground_truth: str,
+        batch_size: int = 10,
+        steps: int = 20,
+        pbar: bool = False,
+    ) -> Dict[str, torch.Tensor]:
+        """Compute module-level attribution tensors for a prompt via integrated gradients."""
+
+        neuron_scores = self.get_scores(
+            prompt,
+            ground_truth,
+            batch_size=batch_size,
+            steps=steps,
+            pbar=pbar,
+            attribution_method="integrated_grads",
+        )
+
+        module_scores: Dict[str, torch.Tensor] = {}
+
+        # The intermediate activations align one-to-one with the neurons in the FF input block.
+        module_scores["ff_intermediate_activations"] = neuron_scores
+
+        input_weight_scores = []
+        output_weight_scores = []
+        for layer_idx in range(self.n_layers()):
+            layer_neuron_scores = neuron_scores[layer_idx]
+
+            input_module = self._get_input_ff_layer(layer_idx)
+            input_weight_tensor = self._get_module_weight_tensor(input_module)
+            input_weight_tensor = input_weight_tensor.to(
+                device=layer_neuron_scores.device, dtype=layer_neuron_scores.dtype
+            )
+            input_weight_scores.append(
+                input_weight_tensor * layer_neuron_scores.unsqueeze(-1)
+            )
+
+            output_weight_tensor = self._get_module_weight_tensor(
+                self._get_output_ff_layer(layer_idx)
+            ).to(device=layer_neuron_scores.device, dtype=layer_neuron_scores.dtype)
+            output_weight_scores.append(
+                output_weight_tensor * layer_neuron_scores.unsqueeze(0)
+            )
+
+        module_scores["ff_input_weight"] = torch.stack(input_weight_scores)
+        module_scores["ff_output_weight"] = torch.stack(output_weight_scores)
+
+        return module_scores
+
+    def score_module_risks(
+        self,
+        risk_prompts: Mapping[str, Sequence[Tuple[str, str]]],
+        *,
+        aggregation: str = "mean",
+        module_kwargs: Optional[Dict[str, object]] = None,
+    ) -> Dict[str, Dict[str, torch.Tensor]]:
+        """
+        Aggregate module-level attribution scores for risk-labelled prompt groups.
+
+        Each key in ``risk_prompts`` is a human-readable risk label (for example,
+        ``"safety"`` or ``"privacy"``). The corresponding value is a sequence of
+        ``(prompt, ground_truth)`` pairs that describe how that risk should be
+        evaluated. Every pair is analysed independently and then merged according to
+        ``aggregation`` to produce the summary tensors for that risk bucket.
+
+        Args:
+            risk_prompts: Mapping of risk labels to their evaluation prompts.
+            aggregation: Element-wise aggregation strategy (``"mean"`` or ``"max"``)
+                used to combine the per-prompt tensors.
+            module_kwargs: Optional overrides forwarded to
+                :meth:`module_integrated_gradients` (for example ``steps`` or
+                ``batch_size``).
+
+        Returns:
+            A mapping from risk label to a dictionary of module attribution tensors.
+            The module keys mirror the feed-forward sub-components of the model so
+            that callers can associate each aggregated tensor with a concrete set of
+            parameters.
+        """
+
+        if aggregation not in {"mean", "max"}:
+            raise ValueError(
+                f"Unsupported aggregation '{aggregation}'. Choose from 'mean' or 'max'."
+            )
+
+        module_kwargs = dict(module_kwargs or {})
+        module_kwargs.setdefault("pbar", False)
+
+        risk_scores: Dict[str, Dict[str, torch.Tensor]] = {}
+
+        for risk_label, prompt_pairs in risk_prompts.items():
+            if not prompt_pairs:
+                raise ValueError(
+                    f"Risk bucket '{risk_label}' must contain at least one prompt."
+                )
+
+            per_prompt_scores = [
+                self.module_integrated_gradients(
+                    prompt,
+                    ground_truth,
+                    **module_kwargs,
+                )
+                for prompt, ground_truth in prompt_pairs
+            ]
+
+            aggregated_scores: Dict[str, torch.Tensor] = {}
+            for module_name in per_prompt_scores[0].keys():
+                stacked = torch.stack(
+                    [scores[module_name] for scores in per_prompt_scores], dim=0
+                )
+                if aggregation == "mean":
+                    agg_tensor = stacked.mean(dim=0)
+                else:
+                    agg_tensor = stacked.max(dim=0).values
+
+                # Each aggregated tensor retains the structure of the underlying
+                # module weights, allowing downstream consumers to map the scores
+                # back to specific feed-forward parameters.
+                aggregated_scores[module_name] = agg_tensor
+
+            risk_scores[risk_label] = aggregated_scores
+
+        return risk_scores
 
     def get_coarse_neurons(
         self,

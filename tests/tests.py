@@ -4,6 +4,9 @@ from knowledge_neurons import (
     model_type,
 )
 import random
+from types import MethodType
+
+import torch
 
 
 def test_gpt(MODEL_NAME: str):
@@ -272,6 +275,82 @@ def test_bert_multilingual():
     print("\nEnhancing random neurons: \n")
     results_dict, unpatch_fn = kn_ml.enhance_knowledge(
         TEXT, GROUND_TRUTH, random_neurons
+    )
+
+
+def _make_dummy_kn():
+    dummy = KnowledgeNeurons.__new__(KnowledgeNeurons)
+
+    base_matrix = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    output_template = torch.tensor(
+        [[[0.5, 1.0], [1.5, 2.0]], [[2.5, 3.0], [3.5, 4.0]]]
+    )
+
+    def fake_module_integrated_gradients(self, prompt, ground_truth, **kwargs):
+        scale = float(len(prompt) + len(ground_truth))
+        activations = base_matrix * scale
+        return {
+            "ff_intermediate_activations": activations,
+            "ff_input_weight": activations.unsqueeze(-1).repeat(1, 1, 2),
+            "ff_output_weight": output_template * scale,
+        }
+
+    dummy.module_integrated_gradients = MethodType(
+        fake_module_integrated_gradients, dummy
+    )
+    return dummy
+
+
+def test_score_module_risks_returns_keys():
+    kn = _make_dummy_kn()
+    risk_prompts = {
+        "safety": [("prompt", "x"), ("another", "y")],
+        "fairness": [("third", "z")],
+    }
+
+    scores = kn.score_module_risks(risk_prompts)
+
+    assert set(scores.keys()) == set(risk_prompts.keys())
+    for risk, module_scores in scores.items():
+        assert set(module_scores.keys()) == {
+            "ff_intermediate_activations",
+            "ff_input_weight",
+            "ff_output_weight",
+        }
+        for tensor in module_scores.values():
+            assert torch.isfinite(tensor).all()
+
+
+def test_score_module_risks_respects_aggregation():
+    kn = _make_dummy_kn()
+    prompts = {"privacy": [("a", "b"), ("abcd", "e")]}
+
+    mean_scores = kn.score_module_risks(prompts, aggregation="mean")
+    max_scores = kn.score_module_risks(prompts, aggregation="max")
+
+    scale_values = [float(len(p) + len(g)) for p, g in prompts["privacy"]]
+    base_matrix = torch.tensor([[1.0, 2.0], [3.0, 4.0]])
+    output_template = torch.tensor(
+        [[[0.5, 1.0], [1.5, 2.0]], [[2.5, 3.0], [3.5, 4.0]]]
+    )
+
+    expected_mean = base_matrix * (sum(scale_values) / len(scale_values))
+    expected_max = base_matrix * max(scale_values)
+
+    torch.testing.assert_close(
+        mean_scores["privacy"]["ff_intermediate_activations"], expected_mean
+    )
+    torch.testing.assert_close(
+        max_scores["privacy"]["ff_intermediate_activations"], expected_max
+    )
+
+    torch.testing.assert_close(
+        mean_scores["privacy"]["ff_output_weight"],
+        output_template * (sum(scale_values) / len(scale_values)),
+    )
+    torch.testing.assert_close(
+        max_scores["privacy"]["ff_output_weight"],
+        output_template * max(scale_values),
     )
 
 
