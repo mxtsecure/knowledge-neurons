@@ -22,46 +22,120 @@ class KnowledgeNeurons:
         self,
         model: nn.Module,
         tokenizer: PreTrainedTokenizerBase,
-        model_type: str = "bert",
         device: str = None,
+        max_target_tokens: int = 20,
     ):
         self.model = model
-        self.model_type = model_type
+        self.tokenizer = tokenizer
         self.device = device or torch.device(
             "cuda" if torch.cuda.is_available() else "cpu"
         )
         self.model.to(self.device)
-        self.tokenizer = tokenizer
+        self.max_target_tokens = max_target_tokens
+
+        self.model_type = getattr(getattr(self.model, "config", object()), "model_type", "autoregressive")
+        if isinstance(self.model_type, str):
+            self.model_type = self.model_type.lower()
 
         self.baseline_activations = None
 
-        if self.model_type == "bert":
-            self.transformer_layers_attr = "bert.encoder.layer"
-            self.input_ff_attr = "intermediate"
-            self.output_ff_attr = "output.dense.weight"
-            self.word_embeddings_attr = "bert.embeddings.word_embeddings.weight"
-            self.unk_token = getattr(self.tokenizer, "unk_token_id", None)
-            self.module_param_attrs = {
-                "q_proj": "attention.self.query",  # Query projection linear layer within multi-head self-attention
-                "k_proj": "attention.self.key",  # Key projection linear layer within multi-head self-attention
-                "v_proj": "attention.self.value",  # Value projection linear layer within multi-head self-attention
-                "o_proj": "attention.output.dense",  # Output projection that mixes attention heads
-                "mlp_up": "intermediate.dense",  # Feed-forward block that expands hidden activations
-                "mlp_down": "output.dense",  # Feed-forward block that projects back to the hidden size
-            }
-        elif "gpt" in model_type:
-            self.transformer_layers_attr = "transformer.h"
-            self.input_ff_attr = "mlp.c_fc"
-            self.output_ff_attr = "mlp.c_proj.weight"
-            self.word_embeddings_attr = "transformer.wpe"
-            self.module_param_attrs = {
-                "qkv_proj": "attn.c_attn",  # Combined query/key/value projection conv1d block
-                "o_proj": "attn.c_proj",  # Attention output projection block
-                "mlp_up": "mlp.c_fc",  # Feed-forward expansion block
-                "mlp_down": "mlp.c_proj",  # Feed-forward contraction block
-            }
+        (
+            self.transformer_layers_attr,
+            self.input_ff_attr,
+            self.output_ff_attr,
+            self.module_param_attrs,
+        ) = self._configure_model_specifics()
+
+    def _configure_model_specifics(self):
+        """Infer architecture-specific attribute paths for autoregressive transformers."""
+
+        layer_attr_candidates = [
+            "model.layers",
+            "model.decoder.layers",
+            "transformer.h",
+            "gpt_neox.layers",
+        ]
+
+        transformer_layers = None
+        transformer_layers_attr = None
+        for attr in layer_attr_candidates:
+            try:
+                layers = get_attributes(self.model, attr)
+            except AttributeError:
+                continue
+            if hasattr(layers, "__len__") and len(layers) > 0:
+                transformer_layers = layers
+                transformer_layers_attr = attr
+                break
+        if transformer_layers is None:
+            raise ValueError("Unable to locate transformer layers for the provided model")
+
+        sample_layer = transformer_layers[0]
+        named_modules = dict(sample_layer.named_modules())
+
+        module_param_attrs = {}
+
+        module_names = list(named_modules.keys())
+
+        def find_by_suffix(*suffixes):
+            for suffix in suffixes:
+                for name in module_names:
+                    if not name:
+                        continue
+                    if name.endswith(suffix):
+                        return name
+            return None
+
+        def find_exact_module(name):
+            if name in named_modules:
+                return name
+            for candidate in module_names:
+                if candidate.endswith(name):
+                    return candidate
+            return None
+
+        input_ff_attr = find_exact_module("mlp") or find_exact_module("feed_forward")
+        if input_ff_attr is None:
+            raise ValueError("Unable to determine feed-forward module for the provided model")
+
+        mlp_up_attr = find_by_suffix("up_proj", "c_fc", "fc1", "wi_1")
+        if mlp_up_attr is not None:
+            module_param_attrs["mlp_up"] = mlp_up_attr
+
+        mlp_down_attr = find_by_suffix("down_proj", "c_proj", "fc2", "wo")
+        if mlp_down_attr is not None:
+            module_param_attrs["mlp_down"] = mlp_down_attr
         else:
-            raise NotImplementedError
+            raise ValueError("Unable to locate the feed-forward down projection for the provided model")
+
+        mlp_gate_attr = find_by_suffix("gate_proj", "gating", "wi_0")
+        if mlp_gate_attr is not None:
+            module_param_attrs["mlp_gate"] = mlp_gate_attr
+
+        qkv_attr = find_by_suffix("c_attn", "attn_fused_qkv")
+        if qkv_attr is not None:
+            module_param_attrs["qkv_proj"] = qkv_attr
+        else:
+            q_attr = find_by_suffix("q_proj", "query")
+            k_attr = find_by_suffix("k_proj", "key")
+            v_attr = find_by_suffix("v_proj", "value")
+            if q_attr is not None:
+                module_param_attrs["q_proj"] = q_attr
+            if k_attr is not None:
+                module_param_attrs["k_proj"] = k_attr
+            if v_attr is not None:
+                module_param_attrs["v_proj"] = v_attr
+
+        o_proj_attr = find_by_suffix("o_proj", "out_proj", "c_proj")
+        if o_proj_attr is not None:
+            module_param_attrs["o_proj"] = o_proj_attr
+
+        output_ff_attr = f"{mlp_down_attr}.weight"
+
+        if not module_param_attrs:
+            raise ValueError("Unable to infer module parameter mappings for the provided model")
+
+        return transformer_layers_attr, input_ff_attr, output_ff_attr, module_param_attrs
 
     def _get_output_ff_layer(self, layer_idx):
         return get_ff_layer(
@@ -80,7 +154,14 @@ class KnowledgeNeurons:
         )
 
     def _get_word_embeddings(self):
-        return get_attributes(self.model, self.word_embeddings_attr)
+        if hasattr(self.model, "get_input_embeddings"):
+            embeddings = self.model.get_input_embeddings()
+            if hasattr(embeddings, "weight"):
+                return embeddings.weight
+            return embeddings
+        if hasattr(self, "word_embeddings_attr") and self.word_embeddings_attr:
+            return get_attributes(self.model, self.word_embeddings_attr)
+        raise AttributeError("Unable to locate input embedding weights for the provided model")
 
     def _get_transformer_layers(self):
         return get_attributes(self.model, self.transformer_layers_attr)
@@ -117,18 +198,13 @@ class KnowledgeNeurons:
     def _prepare_inputs(self, prompt, target=None, encoded_input=None):
         if encoded_input is None:
             encoded_input = self.tokenizer(prompt, return_tensors="pt").to(self.device)
-        if self.model_type == "bert":
-            mask_idx = torch.where(
-                encoded_input["input_ids"][0] == self.tokenizer.mask_token_id
-            )[0].item()
-        else:
-            # with autoregressive models we always want to target the last token
-            mask_idx = -1
+        # with autoregressive models we always want to target the last token
+        mask_idx = -1
         if target is not None:
-            if "gpt" in self.model_type:
-                target = self.tokenizer.encode(target)
-            else:
-                target = self.tokenizer.convert_tokens_to_ids(target)
+            token_ids = self.tokenizer.encode(target, add_special_tokens=False)
+            if self.max_target_tokens is not None:
+                token_ids = token_ids[: self.max_target_tokens]
+            target = token_ids
         return encoded_input, mask_idx, target
 
     def _generate(self, prompt, ground_truth):
@@ -136,10 +212,9 @@ class KnowledgeNeurons:
             prompt, ground_truth
         )
         # for autoregressive models, we might want to generate > 1 token
-        if self.model_type == "gpt":
-            n_sampling_steps = len(target_label)
-        else:
-            n_sampling_steps = 1  # TODO: we might want to use multiple mask tokens even with bert models
+        n_sampling_steps = (
+            len(target_label) if isinstance(target_label, (list, tuple)) else 1
+        )
 
         all_gt_probs = []
         all_argmax_probs = []
@@ -182,10 +257,11 @@ class KnowledgeNeurons:
         return len(self._get_transformer_layers())
 
     def intermediate_size(self):
-        if self.model_type == "bert":
+        if hasattr(self.model.config, "intermediate_size"):
             return self.model.config.intermediate_size
-        else:
+        if hasattr(self.model.config, "hidden_size"):
             return self.model.config.hidden_size * 4
+        raise AttributeError("Model configuration does not expose an intermediate size")
 
     @staticmethod
     def scaled_input(activations: torch.Tensor, steps: int = 20, device: str = "cpu"):
@@ -352,6 +428,72 @@ class KnowledgeNeurons:
                 for module_key in self.module_param_attrs
             }
         return torch.stack(scores)
+
+    def score_module_risks(
+        self,
+        qa_pairs: List[Tuple[str, str]],
+        *,
+        steps: int = 20,
+        batch_size: int = 10,
+        max_answer_tokens: Optional[int] = None,
+        pbar: bool = False,
+    ) -> Dict[str, Dict[str, torch.Tensor]]:
+        """Compute aggregated module-level attribution scores for QA datasets."""
+
+        if not qa_pairs:
+            raise ValueError("Expected at least one question/answer pair")
+
+        original_max_tokens = self.max_target_tokens
+        if max_answer_tokens is not None:
+            self.max_target_tokens = max_answer_tokens
+
+        per_prompt_scores: Dict[str, List[torch.Tensor]] = {
+            key: [] for key in self.module_param_attrs
+        }
+
+        try:
+            for prompt, answer in tqdm(
+                qa_pairs,
+                desc="Scoring module risks...",
+                disable=not pbar,
+            ):
+                module_scores = self.get_scores(
+                    prompt,
+                    answer,
+                    steps=steps,
+                    batch_size=batch_size,
+                    attribution_method="integrated_grads",
+                    pbar=False,
+                    target_scope="modules",
+                )
+                for key, value in module_scores.items():
+                    per_prompt_scores[key].append(value.detach().cpu())
+        finally:
+            self.max_target_tokens = original_max_tokens
+
+        stacked_scores: Dict[str, torch.Tensor] = {}
+        for key, values in per_prompt_scores.items():
+            if values:
+                stacked_scores[key] = torch.stack(values)
+            else:
+                stacked_scores[key] = torch.empty(
+                    (0, self.n_layers()), dtype=torch.float32
+                )
+
+        mean_scores = {
+            key: values.mean(dim=0) if values.numel() > 0 else values
+            for key, values in stacked_scores.items()
+        }
+        max_scores = {
+            key: values.max(dim=0).values if values.numel() > 0 else values
+            for key, values in stacked_scores.items()
+        }
+
+        return {
+            "per_prompt": stacked_scores,
+            "mean": mean_scores,
+            "max": max_scores,
+        }
 
     def get_coarse_neurons(
         self,
@@ -590,10 +732,9 @@ class KnowledgeNeurons:
         )
 
         # for autoregressive models, we might want to generate > 1 token
-        if self.model_type == "gpt":
-            n_sampling_steps = len(target_label)
-        else:
-            n_sampling_steps = 1  # TODO: we might want to use multiple mask tokens even with bert models
+        n_sampling_steps = (
+            len(target_label) if isinstance(target_label, (list, tuple)) else 1
+        )
 
         if attribution_method == "integrated_grads":
             if target_scope == "modules":
@@ -603,8 +744,7 @@ class KnowledgeNeurons:
                 }
 
                 for i in range(n_sampling_steps):
-                    if i > 0 and self.model_type == "gpt":
-                        # retokenize new inputs
+                    if i > 0 and n_sampling_steps > 1:
                         encoded_input, mask_idx, target_label = self._prepare_inputs(
                             prompt, ground_truth
                         )
@@ -640,8 +780,7 @@ class KnowledgeNeurons:
             integrated_grads = []
 
             for i in range(n_sampling_steps):
-                if i > 0 and self.model_type == "gpt":
-                    # retokenize new inputs
+                if i > 0 and n_sampling_steps > 1:
                     encoded_input, mask_idx, target_label = self._prepare_inputs(
                         prompt, ground_truth
                     )
@@ -675,17 +814,11 @@ class KnowledgeNeurons:
                             encoded_input["input_ids"], "b d -> (r b) d", r=batch_size
                         ),
                         "attention_mask": einops.repeat(
-                            encoded_input["attention_mask"],
+                            encoded_input.get("attention_mask", torch.ones_like(encoded_input["input_ids"])),
                             "b d -> (r b) d",
                             r=batch_size,
                         ),
                     }
-                    if self.model_type == "bert":
-                        inputs["token_type_ids"] = einops.repeat(
-                            encoded_input["token_type_ids"],
-                            "b d -> (r b) d",
-                            r=batch_size,
-                        )
 
                     # then patch the model to replace the activations with the scaled activations
                     patch_ff_layer(
@@ -739,8 +872,7 @@ class KnowledgeNeurons:
                 )
             activations = []
             for i in range(n_sampling_steps):
-                if i > 0 and self.model_type == "gpt":
-                    # retokenize new inputs
+                if i > 0 and n_sampling_steps > 1:
                     encoded_input, mask_idx, target_label = self._prepare_inputs(
                         prompt, ground_truth
                     )
@@ -886,109 +1018,9 @@ class KnowledgeNeurons:
         undo_modification: bool = True,
         quiet: bool = False,
     ) -> Tuple[dict, Callable]:
-        """
-        Update the *weights* of the neural net in the positions specified by `neurons`.
-        Specifically, the weights of the second Linear layer in the ff are updated by adding or subtracting the value
-        of the word embeddings for `target`.
-        """
-        assert mode in ["edit", "erase"]
-        assert erase_value in ["zero", "unk"]
-        results_dict = {}
-
-        _, _, target_label = self._prepare_inputs(prompt, target)
-        # get the baseline probabilities of the target being generated + the argmax / greedy completion before modifying the weights
-        (
-            gt_baseline_prob,
-            argmax_baseline_prob,
-            argmax_completion_str,
-            argmax_tokens,
-        ) = self._generate(prompt, target)
-        if not quiet:
-            print(
-                f"\nBefore modification - groundtruth probability: {gt_baseline_prob}\nArgmax completion: `{argmax_completion_str}`\nArgmax prob: {argmax_baseline_prob}"
-            )
-        results_dict["before"] = {
-            "gt_prob": gt_baseline_prob,
-            "argmax_completion": argmax_completion_str,
-            "argmax_prob": argmax_baseline_prob,
-        }
-
-        # get the word embedding values of the baseline + target predictions
-        word_embeddings_weights = self._get_word_embeddings()
-        if mode == "edit":
-            assert (
-                self.model_type == "bert"
-            ), "edit mode currently only working for bert models - TODO"
-            original_prediction_id = argmax_tokens[0]
-            original_prediction_embedding = word_embeddings_weights[
-                original_prediction_id
-            ]
-            target_embedding = word_embeddings_weights[target_label]
-
-        if erase_value == "zero":
-            erase_value = 0
-        else:
-            assert self.model_type == "bert", "GPT models don't have an unk token"
-            erase_value = word_embeddings_weights[self.unk_token]
-
-        # modify the weights by subtracting the original prediction's word embedding
-        # and adding the target embedding
-        original_weight_values = []  # to reverse the action later
-        for layer_idx, position in neurons:
-            output_ff_weights = self._get_output_ff_layer(layer_idx)
-            if self.model_type == "gpt2":
-                # since gpt2 uses a conv1d layer instead of a linear layer in the ff block, the weights are in a different format
-                original_weight_values.append(
-                    output_ff_weights[position, :].detach().clone()
-                )
-            else:
-                original_weight_values.append(
-                    output_ff_weights[:, position].detach().clone()
-                )
-            if mode == "edit":
-                if self.model_type == "gpt2":
-                    output_ff_weights[position, :] -= original_prediction_embedding * 2
-                    output_ff_weights[position, :] += target_embedding * 2
-                else:
-                    output_ff_weights[:, position] -= original_prediction_embedding * 2
-                    output_ff_weights[:, position] += target_embedding * 2
-            else:
-                if self.model_type == "gpt2":
-                    output_ff_weights[position, :] = erase_value
-                else:
-                    output_ff_weights[:, position] = erase_value
-
-        # get the probabilities of the target being generated + the argmax / greedy completion after modifying the weights
-        (
-            new_gt_prob,
-            new_argmax_prob,
-            new_argmax_completion_str,
-            new_argmax_tokens,
-        ) = self._generate(prompt, target)
-        if not quiet:
-            print(
-                f"\nAfter modification - groundtruth probability: {new_gt_prob}\nArgmax completion: `{new_argmax_completion_str}`\nArgmax prob: {new_argmax_prob}"
-            )
-        results_dict["after"] = {
-            "gt_prob": new_gt_prob,
-            "argmax_completion": new_argmax_completion_str,
-            "argmax_prob": new_argmax_prob,
-        }
-
-        def unpatch_fn():
-            # reverse modified weights
-            for idx, (layer_idx, position) in enumerate(neurons):
-                output_ff_weights = self._get_output_ff_layer(layer_idx)
-                if self.model_type == "gpt2":
-                    output_ff_weights[position, :] = original_weight_values[idx]
-                else:
-                    output_ff_weights[:, position] = original_weight_values[idx]
-
-        if undo_modification:
-            unpatch_fn()
-            unpatch_fn = lambda *args: args
-
-        return results_dict, unpatch_fn
+        raise NotImplementedError(
+            "Weight editing workflows are not supported for autoregressive models"
+        )
 
     def edit_knowledge(
         self,
